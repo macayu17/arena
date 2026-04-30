@@ -1,18 +1,25 @@
 # CLAUDE.md
 
-This file documents AI-tooling usage for the challenge.
+This file records how AI assistance was used while working on the ETA challenge.
 
-## How AI tooling was used
+## Tooling use
 
-- Rapid experiment generation for feature engineering and smoothing variants.
-- Fast iteration on training/evaluation scripts.
-- Refactoring and packaging checks for the Dockerized submission surface.
+I used AI assistance for quick iteration, mainly to:
 
-## Final model summary
+- sketch experiment scripts for route/time aggregation ideas
+- compare smoothing and calibration variants quickly
+- refactor the training code into a repeatable script
+- check the Docker submission path and README coverage
 
-- Hierarchical zone/time lookup model trained in log-duration space.
-- Smoothed backoff chain:
-  - `(pickup, dropoff, hour, dow)` -> `(pickup, dropoff, hour)` -> `(pickup, dropoff)` -> pickup/dropoff marginals
-- Final calibrated inference:
-  - `prediction = exp(pred_log) * 0.985`
-  - Clipped to `[30, 10800]` seconds.
+The final inference path is deterministic and self-contained. It does not call any AI service or external API.
+
+## Final model notes
+
+The submitted model is a log-duration hierarchical lookup:
+
+- route + hour + day-of-week table
+- route + hour + month table
+- route + hour and route-pair backoff priors
+- count-weighted blend between day-of-week and month estimates
+
+The trained artifact stores compact lookup arrays so the repo can be pushed without Git LFS while still staying comfortably inside the Docker size limit.

@@ -1,18 +1,24 @@
 # AGENTS.md
 
-This repository was developed as an individual Gobblecube ETA challenge submission.
+Notes for anyone running or reviewing this submission.
 
-## Ownership
+## Scope
 
-- Single-author submission (no collaborator contributions).
+This repository is for the Gobblecube ETA challenge only. It does not include the Crossing challenge starter.
 
-## Inference behavior
+## Runtime contract
 
-- `predict.py` is deterministic and self-contained.
-- Inference uses only local artifacts (`model.pkl`) and standard Python libraries.
-- No network or external API calls are made during prediction.
+- `predict.py` exposes `predict(request: dict) -> float`
+- `model.pkl` is loaded locally at import time
+- prediction is deterministic
+- inference makes no network calls
 
-## Packaging
+## Grader path
 
-- Root-level `Dockerfile` is the submission entrypoint.
-- Grader interface is `python grade.py <input.parquet> <output.csv>`.
+The Docker entrypoint runs:
+
+```bash
+python grade.py <input.parquet> <output.csv>
+```
+
+The output CSV contains `row_idx` and `prediction`, matching the starter grader contract.
