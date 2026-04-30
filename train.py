@@ -22,18 +22,22 @@ ZONE_MAX = 265
 ZONE_DIM = ZONE_MAX + 1
 HOURS = 24
 DOWS = 7
+MONTHS = 12
 
 
 @dataclass(frozen=True)
 class Smoothing:
     k_pair: float = 0.3
-    k_pair_hour: float = 3.0
-    k_pair_hour_dow: float = 5.0
+    k_pair_hour: float = 3.3
+    k_pair_hour_dow: float = 4.7
+    k_pair_hour_month: float = 8.0
+    month_blend_alpha: float = 0.5
+    month_weight_bins: int = 63
 
 
 @dataclass(frozen=True)
 class Calibration:
-    output_scale: float = 0.985
+    output_scale: float = 0.987
     clip_min: float = 30.0
     clip_max: float = 10_800.0
 
@@ -42,6 +46,7 @@ def _zero_stats() -> dict[str, np.ndarray | float | int]:
     pair_size = ZONE_DIM * ZONE_DIM
     pair_hour_size = pair_size * HOURS
     pair_hour_dow_size = pair_hour_size * DOWS
+    pair_hour_month_size = pair_hour_size * MONTHS
 
     return {
         "global_sum": 0.0,
@@ -56,6 +61,8 @@ def _zero_stats() -> dict[str, np.ndarray | float | int]:
         "pair_hour_count": np.zeros(pair_hour_size, dtype=np.int64),
         "pair_hour_dow_sum": np.zeros(pair_hour_dow_size, dtype=np.float64),
         "pair_hour_dow_count": np.zeros(pair_hour_dow_size, dtype=np.int64),
+        "pair_hour_month_sum": np.zeros(pair_hour_month_size, dtype=np.float64),
+        "pair_hour_month_count": np.zeros(pair_hour_month_size, dtype=np.int64),
     }
 
 
@@ -65,13 +72,14 @@ def _safe_mean(sum_arr: np.ndarray, count_arr: np.ndarray, fallback: float) -> n
     return out
 
 
-def _extract_time_parts(ts_str: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+def _extract_time_parts(ts_str: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ts = pd.to_datetime(ts_str, errors="coerce")
     if ts.isna().any():
         raise ValueError("Invalid timestamps found in requested_at.")
     hour = ts.dt.hour.to_numpy(dtype=np.int32)
     dow = ts.dt.dayofweek.to_numpy(dtype=np.int32)
-    return hour, dow
+    month = ts.dt.month.to_numpy(dtype=np.int32) - 1
+    return hour, dow, month
 
 
 def _transform_target(y_seconds: np.ndarray, mode: str) -> np.ndarray:
@@ -99,15 +107,17 @@ def _accumulate_batch(
     do = df["dropoff_zone"].to_numpy(dtype=np.int32, copy=False)
     y_seconds = df["duration_seconds"].to_numpy(dtype=np.float64, copy=False)
     y = _transform_target(y_seconds, mode=target_mode)
-    hour, dow = _extract_time_parts(df["requested_at"])
+    hour, dow, month = _extract_time_parts(df["requested_at"])
 
     pair_idx = pu * ZONE_DIM + do
     pair_hour_idx = pair_idx * HOURS + hour
     pair_hour_dow_idx = pair_hour_idx * DOWS + dow
+    pair_hour_month_idx = pair_hour_idx * MONTHS + month
 
     pair_size = ZONE_DIM * ZONE_DIM
     pair_hour_size = pair_size * HOURS
     pair_hour_dow_size = pair_hour_size * DOWS
+    pair_hour_month_size = pair_hour_size * MONTHS
 
     stats["global_sum"] = float(stats["global_sum"]) + float(y.sum())
     stats["global_count"] = int(stats["global_count"]) + int(y.size)
@@ -130,6 +140,13 @@ def _accumulate_batch(
     )
     stats["pair_hour_dow_count"] += np.bincount(
         pair_hour_dow_idx, minlength=pair_hour_dow_size
+    )
+
+    stats["pair_hour_month_sum"] += np.bincount(
+        pair_hour_month_idx, weights=y, minlength=pair_hour_month_size
+    )
+    stats["pair_hour_month_count"] += np.bincount(
+        pair_hour_month_idx, minlength=pair_hour_month_size
     )
 
 
@@ -201,13 +218,40 @@ def build_lookup_table(
     pair_hour_dow_count = stats["pair_hour_dow_count"].reshape(
         ZONE_DIM, ZONE_DIM, HOURS, DOWS
     )
-    table = (pair_hour_dow_sum + smoothing.k_pair_hour_dow * pair_hour_prior[..., None]) / (
+    table_dow = (pair_hour_dow_sum + smoothing.k_pair_hour_dow * pair_hour_prior[..., None]) / (
         pair_hour_dow_count + smoothing.k_pair_hour_dow
     )
 
-    table[0, :, :, :] = global_center
-    table[:, 0, :, :] = global_center
-    table = table.astype(np.float32)
+    pair_hour_month_sum = stats["pair_hour_month_sum"].reshape(
+        ZONE_DIM, ZONE_DIM, HOURS, MONTHS
+    )
+    pair_hour_month_count = stats["pair_hour_month_count"].reshape(
+        ZONE_DIM, ZONE_DIM, HOURS, MONTHS
+    )
+    table_month = (
+        pair_hour_month_sum + smoothing.k_pair_hour_month * pair_hour_prior[..., None]
+    ) / (pair_hour_month_count + smoothing.k_pair_hour_month)
+
+    month_weight = smoothing.month_blend_alpha * pair_hour_month_count / (
+        pair_hour_month_count + smoothing.k_pair_hour_month
+    )
+
+    table_dow[0, :, :, :] = global_center
+    table_dow[:, 0, :, :] = global_center
+    table_month[0, :, :, :] = global_center
+    table_month[:, 0, :, :] = global_center
+    month_weight[0, :, :, :] = 0.0
+    month_weight[:, 0, :, :] = 0.0
+
+    table_dow = table_dow.astype(np.float16)
+    table_month = table_month.astype(np.float16)
+    month_weight_u8 = np.rint(
+        month_weight * smoothing.month_weight_bins / smoothing.month_blend_alpha
+    )
+    month_weight_u8 = np.clip(month_weight_u8, 0, smoothing.month_weight_bins).astype(
+        np.uint8
+    )
+    month_weight_scale = smoothing.month_blend_alpha / smoothing.month_weight_bins
 
     global_duration = float(
         np.clip(
@@ -219,12 +263,16 @@ def build_lookup_table(
     )
 
     return {
-        "version": 2,
+        "version": 4,
         "target_mode": target_mode,
         "output_scale": float(calibration.output_scale),
         "global_center": float(global_center),
         "global_prediction": global_duration,
-        "table": table,
+        "table": table_dow,
+        "table_dow": table_dow,
+        "table_month": table_month,
+        "month_weight_u8": month_weight_u8,
+        "month_weight_scale": float(month_weight_scale),
         "clip_min": float(calibration.clip_min),
         "clip_max": float(calibration.clip_max),
         "zone_max": ZONE_MAX,
@@ -232,12 +280,50 @@ def build_lookup_table(
             "k_pair": smoothing.k_pair,
             "k_pair_hour": smoothing.k_pair_hour,
             "k_pair_hour_dow": smoothing.k_pair_hour_dow,
+            "k_pair_hour_month": smoothing.k_pair_hour_month,
+            "month_blend_alpha": smoothing.month_blend_alpha,
+            "month_weight_bins": smoothing.month_weight_bins,
         },
     }
 
 
-def _predict_array(model: dict, pu: np.ndarray, do: np.ndarray, hour: np.ndarray, dow: np.ndarray) -> np.ndarray:
-    raw = model["table"][pu, do, hour, dow].astype(np.float64, copy=False)
+def _predict_array(
+    model: dict,
+    pu: np.ndarray,
+    do: np.ndarray,
+    hour: np.ndarray,
+    dow: np.ndarray,
+    month: np.ndarray | None = None,
+) -> np.ndarray:
+    table_dow = model.get("table_dow", model["table"])
+    raw_dow = table_dow[pu, do, hour, dow].astype(np.float64, copy=False)
+    if month is not None and "table_month" in model:
+        raw_month = model["table_month"][pu, do, hour, month].astype(
+            np.float64, copy=False
+        )
+        if "month_weight_u8" in model:
+            month_weight = model["month_weight_u8"][pu, do, hour, month].astype(
+                np.float64, copy=False
+            )
+            month_weight *= float(model["month_weight_scale"])
+            raw = (raw_dow + month_weight * raw_month) / (1.0 + month_weight)
+        else:
+            dow_weight = model["dow_weight"][pu, do, hour, dow].astype(
+                np.float64, copy=False
+            )
+            month_weight = model["month_weight"][pu, do, hour, month].astype(
+                np.float64, copy=False
+            )
+            denom = dow_weight + month_weight
+            raw = raw_dow.copy()
+            np.divide(
+                dow_weight * raw_dow + month_weight * raw_month,
+                denom,
+                out=raw,
+                where=denom > 0,
+            )
+    else:
+        raw = raw_dow
     target_mode = model.get("target_mode", "raw")
     pred = _inverse_target(raw, mode=target_mode)
     pred = pred * float(model.get("output_scale", 1.0))
@@ -255,12 +341,12 @@ def evaluate_dev(model: dict, dev_path: Path) -> float:
             "duration_seconds",
         ],
     )
-    hour, dow = _extract_time_parts(dev["requested_at"])
+    hour, dow, month = _extract_time_parts(dev["requested_at"])
     pu = dev["pickup_zone"].to_numpy(dtype=np.int32, copy=False)
     do = dev["dropoff_zone"].to_numpy(dtype=np.int32, copy=False)
     y = dev["duration_seconds"].to_numpy(dtype=np.float64, copy=False)
 
-    preds = _predict_array(model, pu=pu, do=do, hour=hour, dow=dow)
+    preds = _predict_array(model, pu=pu, do=do, hour=hour, dow=dow, month=month)
     mae = float(np.mean(np.abs(preds - y)))
     return mae
 
@@ -298,9 +384,12 @@ def parse_args() -> argparse.Namespace:
         help="Optimization space for the hierarchical table",
     )
     parser.add_argument("--k-pair", type=float, default=0.3)
-    parser.add_argument("--k-pair-hour", type=float, default=3.0)
-    parser.add_argument("--k-pair-hour-dow", type=float, default=5.0)
-    parser.add_argument("--output-scale", type=float, default=0.985)
+    parser.add_argument("--k-pair-hour", type=float, default=3.3)
+    parser.add_argument("--k-pair-hour-dow", type=float, default=4.7)
+    parser.add_argument("--k-pair-hour-month", type=float, default=8.0)
+    parser.add_argument("--month-blend-alpha", type=float, default=0.5)
+    parser.add_argument("--month-weight-bins", type=int, default=63)
+    parser.add_argument("--output-scale", type=float, default=0.987)
     parser.add_argument("--clip-min", type=float, default=30.0)
     parser.add_argument("--clip-max", type=float, default=10_800.0)
     return parser.parse_args()
@@ -312,6 +401,9 @@ def main() -> None:
         k_pair=args.k_pair,
         k_pair_hour=args.k_pair_hour,
         k_pair_hour_dow=args.k_pair_hour_dow,
+        k_pair_hour_month=args.k_pair_hour_month,
+        month_blend_alpha=args.month_blend_alpha,
+        month_weight_bins=args.month_weight_bins,
     )
     calibration = Calibration(
         output_scale=args.output_scale,

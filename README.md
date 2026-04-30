@@ -8,8 +8,8 @@ I focused on one goal: **beat the baseline with a model that is simple, fast, an
 
 ## Final score
 
-- **Dev MAE (full dev set): 256.1 seconds**
-- **Dev MAE (50k sample via `python grade.py`): 258.8 seconds**
+- **Dev MAE (full dev set): 253.8 seconds** (253.803 rounded)
+- **Dev MAE (50k sample via `python grade.py`): 256.7 seconds**
 
 For context, this is a large improvement over the provided GBT baseline (~351 s on Dev).
 
@@ -40,35 +40,45 @@ Also included (as requested in the main take-home README):
 
 I ended up with a **hierarchical historical lookup model in log-duration space**, not a neural net and not a single global regressor.
 
-At training time, I aggregate `log(duration_seconds)` at three levels:
+At training time, I aggregate `log(duration_seconds)` at four levels:
 
 1. `(pickup_zone, dropoff_zone, hour, day_of_week)`
-2. `(pickup_zone, dropoff_zone, hour)`
-3. `(pickup_zone, dropoff_zone)`
+2. `(pickup_zone, dropoff_zone, hour, month)`
+3. `(pickup_zone, dropoff_zone, hour)`
+4. `(pickup_zone, dropoff_zone)`
 
 Then I smooth each level into the broader level beneath it:
 
 - `pair-hour-dow` backs off to `pair-hour`
+- `pair-hour-month` backs off to `pair-hour`
 - `pair-hour` backs off to `pair`
 - `pair` backs off to pickup/dropoff marginal priors
 
-Final tuned smoothing values:
+Final tuned configuration:
 
 - `k_pair = 0.3`
-- `k_pair_hour = 3.0`
-- `k_pair_hour_dow = 5.0`
+- `k_pair_hour = 3.3`
+- `k_pair_hour_dow = 4.7`
+- `k_pair_hour_month = 8.0`
+- month blend weight multiplier `0.5`
+- month confidence quantization bins `63`
+- output scale `0.987`
 
 At inference:
 
-1. Lookup the smoothed log prediction
-2. Convert with `exp(pred_log)`
-3. Apply a scalar calibration `* 0.985`
-4. Clip to `[30, 10800]` seconds
+1. Lookup the smoothed day-of-week log prediction
+2. Lookup the smoothed month log prediction
+3. Blend them using count-derived confidence weights
+4. Convert with `exp(pred_log)`
+5. Apply a scalar calibration `* 0.987`
+6. Clip to `[30, 10800]` seconds
 
 Why this worked better than my early attempts:
 
 - The target is heavy-tailed, and raw means are too sensitive to outliers.
 - Log-space + hierarchical backoff behaved closer to a conditional median, which aligns better with MAE.
+- Month-aware blending helped because the held-out Dev window is late December, where traffic patterns are not perfectly represented by a year-wide route average.
+- I store the lookup tables as `float16` and quantize the month confidence weights so the trained artifact stays under GitHub's normal file-size limit.
 - The model keeps strong route/time locality while still handling sparse combinations cleanly.
 
 ---
@@ -89,7 +99,7 @@ I kept notes while iterating; these were the main dead ends:
 
 - **No external API calls at inference:** yes
 - **CPU inference target (<= 200 ms/request):** yes (single lookup + timestamp parse)
-- **Docker image size <= 2.5 GB:** yes (about 679 MB)
+- **Docker image size <= 2.5 GB:** yes (well below the limit)
 
 ---
 
