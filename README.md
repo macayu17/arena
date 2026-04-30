@@ -1,58 +1,70 @@
-# Gobblecube AI Builder Take-Home
+# ETA Challenge Submission
 
-We're hiring **AI Builders**: engineers who pick up unfamiliar problems,
-figure them out with whatever tools help, and ship something that works.
-Pick one of the two challenges below, build a working Dockerized
-submission, and send us the repo link when it's something you'd put
-your name on.
+## Final score
 
-## The two challenges
+Dev MAE (full dev): **256.1 s**  
+Dev MAE (50k local sample via `python grade.py`): **258.8 s**
 
-- **[The ETA Challenge](./eta-challenge-starter/):** ride-hailing ETA
-  prediction on public NYC taxi data. Regress a single number: trip
-  duration in seconds. Scored on MAE against a held-out 2024 slice.
-  The repo baseline lands at ~367 s there.
-- **[The Crossing Challenge](./crossing-challenge-starter/):** pedestrian
-  crossing-intent + 2-second trajectory for a slow-speed autonomous
-  delivery vehicle. Scored on a joint BCE + pixel-ADE composite, each
-  term normalized so "do nothing" = 1.0. The repo baseline lands at
-  0.74 there.
+## Approach
 
-Pick **one**. One submission per candidate.
+This submission uses a **hierarchical historical lookup model in log-duration space** instead of gradient boosting:
 
-## How grading works
+1. Aggregate historical `log(duration_seconds)` on:
+   - `(pickup_zone, dropoff_zone)`
+   - `(pickup_zone, dropoff_zone, hour)`
+   - `(pickup_zone, dropoff_zone, hour, day_of_week)`
+2. Apply smoothing so sparse groups back off gracefully:
+   - pair-level estimates back off to pickup/dropoff marginals
+   - pair-hour backs off to pair
+   - pair-hour-dow backs off to pair-hour
+   - tuned smoothing strengths: `k_pair=0.3`, `k_pair_hour=3.0`, `k_pair_hour_dow=5.0`
+3. At inference, convert with `exp(pred_log)` and apply a calibrated global scale `0.985`, then clip to `[30, 10800]`.
+4. Store the final dense lookup table in `model.pkl` and answer each request with one table lookup.
 
-The two challenges have **separate leaderboards**. You are not ranked
-against candidates who picked the other one. A strong Crossing submission
-and a strong ETA submission are treated as equivalent signal for the role.
+Using log-space improves robustness to long-tail durations and better approximates the conditional median, which aligns with MAE. Inference remains very fast (single CPU lookup plus timestamp parsing).
 
-Each starter README explains what its scoring harness does. Beat the
-baseline by as much as you can; we'll tell you how it stacks up.
+## What I tried that did not work as well
 
-## Same rules either way
+- The provided XGBoost baseline features (zone IDs + calendar fields) underfit this problem and scored much worse than high-granularity historical route-time statistics.
+- Pure pair averages without hour/day context miss major traffic-pattern shifts.
+- Over-smoothing pair-level estimates increased MAE by washing out route-specific signal.
+- Recency weighting and residual XGBoost stacking both degraded Dev MAE versus the tuned hierarchical lookup.
 
-- Submit a **public GitHub repo** containing `predict.py`, a `Dockerfile`,
-  your trained weights, and a README. Details and constraints (image size,
-  runtime limits, disqualifiers) live in each starter's README. Read the
-  one you pick carefully.
-- Use whatever AI tooling helps you ship. Claude Code is our in-house
-  favourite, but Codex, Cursor, Copilot, plain-API integrations, or no LLM at all are
-  fine. We're scoring the submission, not the toolchain. Your git
-  history is part of what we look at.
-- No external API calls at inference time, no collaborators, no training on
-  the Eval set.
-- Include the Claude.md/Agents.md and relevant markdown files with the submission
+## Where AI tooling helped most
 
-## What we actually care about
+- Rapidly iterated candidate feature hierarchies and fallback strategies.
+- Produced fast experiment scripts to compare MAE across multiple smoothing setups.
+- Refactored training into a memory-safe batch aggregation pipeline over Parquet data.
 
-A clean submission with an honest README will beat a slightly better score
-with no write-up. We read three things, roughly in this order:
+## Next experiments
 
-1. **Do you ship?** The number on the leaderboard.
-2. **Can you learn fast?** Your git log shows the trajectory. First
-   commits rarely look like final ones.
-3. **Can you reason about a problem that wasn't handed to you as a spec?**
-   Your README explains what you tried, what failed, and what the next
-   experiment would be if you kept going.
+- Add external weather/holiday features to capture systematic shocks not visible in request metadata.
+- Add geometric features (zone-centroid distance and borough-level priors) and blend with this lookup model.
+- Try approximate group-median estimators (e.g., quantile sketches) directly instead of log-mean approximation.
 
-Submit your repo URL to agentic-hiring@gobblecube.ai.
+## Submission contract checklist
+
+- `predict.py` at repo root exposes `predict(request: dict) -> float`
+- `Dockerfile` at repo root builds in under 10 minutes
+- `model.pkl` at repo root contains trained weights
+- `README.md` describes approach and results
+- No external API calls at inference time
+- Docker image size: ~`679MB` (well below `2.5GB`)
+- Single-request inference latency: far below `200ms` on CPU
+
+## Reproducibility
+
+From repo root:
+
+```bash
+python data/download_data.py
+python train.py --out model.pkl
+python grade.py
+```
+
+Docker packaging test:
+
+```bash
+docker build -t my-eta .
+docker run --rm -v $(pwd)/data:/work my-eta /work/dev.parquet /work/preds.csv
+```
